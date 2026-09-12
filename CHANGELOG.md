@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-## [1.10.0] - 2026-07-xx
+## [1.10.0] - 2026-09-13
 
 ### Added
 
@@ -34,11 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Prevent excessive tile fetching for static CT logs (#104)
+- Fix off-by-one is Static CT path causing refetches of non-growing logs by @FiloSottile in https://github.com/d-Rickyy-b/certstream-server-go/pull/114
 - Calculate correct starting tile index for static ct logs (a2b4a9f)
 - Use proper websocket close code (1008) instead of 1005, which wasn't sent to the client (76ff240)
 - Respect ct_index path in config file for the `create-index` command (67838a9)
 - Ensure all additionalLog entries are processed correctly (c8bd735)
-- Reload CT index from metrics before restarting the worker (85e90bf)
+- Reload CT index from metrics before restarting the worker (85e90bf, #113)
 
 ## [1.9.0] - 2026-04-03
 
