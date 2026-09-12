@@ -3,8 +3,19 @@ webserver:
   listen_addr: "0.0.0.0"
   listen_port: 8080
   # If you want to use a reverse proxy in front of the server, set this to true
-  # It will use the X-Forwarded-For header to get the real IP of the client
+  # It will use the X-Forwarded-For / X-Real-IP headers to get the real IP of the client
   real_ip: false
+  # List of trusted proxy IPs or CIDR ranges whose X-Forwarded-For / X-Real-IP headers
+  # are honored when real_ip is true. When left empty every connecting IP is trusted.
+  # Restricting this to your actual proxy IPs prevents clients from spoofing their address
+  # by injecting a forged forwarded header. Note: X-Forwarded-For can contain a chain of
+  # IPs (e.g. "client, proxy1, proxy2"); only the first (leftmost) entry is used as the real client IP.
+  trusted_proxies:
+    - "172.16.0.0/12"
+  # If you want to restrict access to the server to specific IPs or CIDR ranges, you can add them to the whitelist.
+  # If the whitelist is empty, all IPs are allowed to access the server.
+  whitelist:
+    - "127.0.0.1/8"
   full_url: "/full-stream"
   lite_url: "/"
   domains_only_url: "/domains-only"
@@ -20,8 +31,40 @@ prometheus:
   metrics_url: "/metrics"
   expose_system_metrics: false
   real_ip: false
+  # List of trusted proxy IPs or CIDR ranges (see webserver.trusted_proxies for details).
+  #trusted_proxies:
+  #  - "127.0.0.1"
   whitelist:
     - "127.0.0.1/8"
+
+# Configuration related to external stream processing tools go here.
+stream_processing:
+  # List of stream processing configurations.
+  # Each configuration specifies a stream processing tool to use and its settings.
+  - name: "kafka-prod"
+    # Type describes the type of stream processing tool to use.
+    # Supported types: "kafka", "nqs"
+    type: "kafka"
+    # The stream type can be any of "full", "lite", "domains-only" - same as the certstream websocket urls
+    # Default is "full"
+    stream: "full"
+    # Enable or disable this stream processing configuration.
+    enabled: true
+    # The server address and port to connect to the stream processing tool
+    server_addr: "127.0.0.1"
+    server_port: 9092
+    topic: "certstream"
+    # Available compression types depend on the stream processing tool.
+    # E.g. for Kafka, supported types are "none" / "", "gzip", "snappy", "lz4", "zstd"
+    compression: ""
+
+  - name: "nqs-prod"
+    type: "nqs"
+    stream: "lite"
+    enabled: false
+    server_addr: "127.0.0.1"
+    server_port: 9092
+    topic: "certstream"
 
 general:
   # DisableDefaultLogs indicates whether the default logs used in Google Chrome and provided by Google should be disabled.
@@ -38,6 +81,13 @@ general:
   #    operator: "Cloudflare"
   #    description: "Cloudflare 'Raio2025h2b'"
 
+  # Exclude logs from being monitored.
+  # You can either exclude by operator (all logs of that operator)
+  # or by a specific log URL.
+  #excluded_logs:
+  #  - operator: "Google"
+  #  - url: "https://ct.googleapis.com/logs/us1/argon2024/"
+
   # To optimize the performance of the server, you can overwrite the size of different buffers
   # For low CPU, low memory machines, you should reduce the buffer sizes to save memory in case the CPU is maxed.
   buffer_sizes:
@@ -45,9 +95,8 @@ general:
     websocket: 300
     # Buffer for each CT log connection
     ctlog: 1000
-    # Combined buffer for the broadcast manager
-    broadcastmanager: 10000
-
+    # Combined buffer for the cert dispatcher
+    dispatcher: 10000
   # Google regularly updates the log list. If this option is set to true, the server will remove all logs no longer listed in the Google log list.
   # This option defaults to true. See https://github.com/d-Rickyy-b/certstream-server-go/issues/51
   drop_old_logs: true

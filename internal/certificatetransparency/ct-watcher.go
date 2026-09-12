@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/d-Rickyy-b/certstream-server-go/internal/broadcast"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/config"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/metrics"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/models"
@@ -75,7 +76,7 @@ func (w *Watcher) Start() {
 
 		// Start background job to save CTIndexes at regular intervals
 		storageInterval := time.Second * 30
-		go metrics.Metrics.SaveCertIndexesAtInterval(storageInterval, ctIndexFilePath)
+		go metrics.Metrics.SaveCertIndexesAtInterval(w.context, storageInterval, ctIndexFilePath)
 	}
 
 	// initialize the watcher with currently available logs
@@ -119,7 +120,7 @@ func (w *Watcher) updateLogs() {
 
 	log.Println("Checking for new ct logs...")
 
-	// Track all URLs that should be monitored after reconciliation
+	// Track all URLs that should be monitored after reconciliation.
 	monitoredURLs := make(map[string]struct{})
 	newCTs := 0
 
@@ -310,6 +311,7 @@ func (w *Watcher) CreateIndexFile(filePath string) error {
 			log.Println("Fetching checkpoint for", normalizedURL)
 
 			staticCTClient := NewStaticCTClient(transparencyLog.MonitoringURL, httpClient, UserAgent, 0)
+
 			checkpoint, fetchErr := staticCTClient.FetchCheckpoint(w.context)
 			if fetchErr != nil {
 				log.Printf("Could not get checkpoint for '%s': %s\n", transparencyLog.MonitoringURL, fetchErr)
@@ -324,7 +326,7 @@ func (w *Watcher) CreateIndexFile(filePath string) error {
 
 	saveErr := metrics.Metrics.SaveCertIndexes(filePath)
 	if saveErr != nil {
-		return saveErr
+		return fmt.Errorf("failed to save cert index: %w", saveErr)
 	}
 
 	log.Println("Index file saved to", filePath)
@@ -371,6 +373,10 @@ func (w *worker) startDownloadingCerts(ctx context.Context) {
 	w.mu.Unlock()
 
 	for {
+		// reload the CT index from metrics before restarting the worker
+		lastCTIndex := metrics.Metrics.GetCTIndex(normalizeCtlogURL(w.ctURL))
+		w.ctIndex = lastCTIndex
+
 		log.Printf("Starting worker for CT log: %s\n", w.ctURL)
 
 		var workerErr error
@@ -443,9 +449,15 @@ func (w *worker) runStandardWorker(ctx context.Context) error {
 		w.ctIndex = sth.TreeSize
 	}
 
+	// Handle gosec G115 warning
+	if w.ctIndex > math.MaxInt64 {
+		log.Printf("index (%d) exceeds math.MaxInt64, skipping\n", w.ctIndex)
+		return nil
+	}
+
 	certScanner := scanner.NewScanner(jsonClient, scanner.ScannerOptions{
 		FetcherOptions: scanner.FetcherOptions{
-			BatchSize:     100,
+			BatchSize:     256,
 			ParallelFetch: 1,
 			StartIndex:    int64(w.ctIndex),
 			Continuous:    true,
@@ -473,8 +485,8 @@ func (w *worker) runTiledWorker(ctx context.Context) error {
 	staticCTClient := NewStaticCTClient(w.ctURL, httpClient, UserAgent, w.ctIndex)
 
 	// If recovery is enabled and the CT index is set, we start at the saved index. Otherwise, we start at the latest checkpoint.
-	validSavedCTIndexExists := config.AppConfig.General.Recovery.Enabled
-	if !validSavedCTIndexExists {
+	recoveryEnabled := config.AppConfig.General.Recovery.Enabled
+	if !recoveryEnabled {
 		checkpoint, err := staticCTClient.FetchCheckpoint(ctx)
 		if err != nil {
 			log.Printf("Could not get checkpoint for '%s': %s\n", w.ctURL, err)
@@ -546,7 +558,7 @@ func certHandler(entryChan chan models.Entry) {
 		}
 
 		// Run JSON encoding in the background and send the result to the clients.
-		web.ClientHandler.Broadcast <- entry
+		broadcast.ClientHandler.MessageQueue <- entry
 
 		// Update metrics
 		url := entry.Data.Source.NormalizedURL
@@ -555,150 +567,6 @@ func certHandler(entryChan chan models.Entry) {
 
 		metrics.Metrics.Inc(operator, url, index)
 	}
-}
-
-// LogListFetcher defines a function type for fetching a log list. This allows us to inject different
-// implementations (e.g. for testing).
-type LogListFetcher func() (loglist3.LogList, error)
-
-// googleLogListFetcher fetches the list of all CT logs from Google Chromes CT LogList.
-func googleLogListFetcher() (loglist3.LogList, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	httpClient := newHTTPClient()
-
-	req, newReqErr := http.NewRequestWithContext(ctx, http.MethodGet, loglist3.LogListURL, nil)
-	if newReqErr != nil {
-		return loglist3.LogList{}, fmt.Errorf("failed to create loglist request: %w", newReqErr)
-	}
-
-	// Download the list of all logs from ctLogInfo and decode JSON
-	resp, reqErr := httpClient.Do(req)
-	if reqErr != nil {
-		return loglist3.LogList{}, fmt.Errorf("failed to execute loglist request: %w", reqErr)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return loglist3.LogList{}, fmt.Errorf("%w: unexpected status code %d", ErrRequestFailed, resp.StatusCode)
-	}
-
-	bodyBytes, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return loglist3.LogList{}, fmt.Errorf("failed reading response body: %w", readErr)
-	}
-
-	allLogs, parseErr := loglist3.NewFromJSON(bodyBytes)
-	if parseErr != nil {
-		return loglist3.LogList{}, fmt.Errorf("failed parsing response body: %w", parseErr)
-	}
-
-	return *allLogs, nil
-}
-
-// getAllLogs returns a list of all CT logs - those from the Google list, if not disabled -
-// and additional logs provided via the config.
-func getAllLogs(logListFetcher LogListFetcher) (loglist3.LogList, error) {
-	var allLogs loglist3.LogList
-
-	// Ability to disable default logs, if the user only wants to monitor custom logs.
-	if !config.AppConfig.General.DisableDefaultLogs {
-		var err error
-
-		allLogs, err = logListFetcher()
-		if err != nil {
-			log.Printf("Error fetching log list from Google: %s\n", err)
-			return loglist3.LogList{}, fmt.Errorf("failed to fetch log list from Google: %w", err)
-		}
-	}
-
-logFound:
-	//
-	for _, additionalLog := range config.AppConfig.General.AdditionalLogs {
-		customLog := loglist3.Log{
-			URL:         additionalLog.URL,
-			Description: additionalLog.Description,
-		}
-
-		operatorFound := false
-
-		for _, operator := range allLogs.Operators {
-			// Only compare logs with the same operator
-			if operator.Name != additionalLog.Operator {
-				continue
-			}
-
-			operatorFound = true
-
-			// Check if user provided log is already in our loglist
-			for _, ctlog := range operator.Logs {
-				if ctlog.URL == additionalLog.URL {
-					// Log already exists, skip it.
-					break logFound
-				}
-			}
-
-			// This works, since allLogs.Operators is a slice of pointers.
-			operator.Logs = append(operator.Logs, &customLog)
-
-			break
-		}
-
-		if !operatorFound {
-			newOperator := loglist3.Operator{
-				Name: additionalLog.Operator,
-				Logs: []*loglist3.Log{&customLog},
-			}
-			allLogs.Operators = append(allLogs.Operators, &newOperator)
-		}
-	}
-
-	for _, additionalLog := range config.AppConfig.General.AdditionalTiledLogs {
-		customLog := loglist3.TiledLog{
-			MonitoringURL: additionalLog.URL,
-			Description:   additionalLog.Description,
-		}
-
-		operatorFound := false
-
-	tiledLogFound:
-		for _, operator := range allLogs.Operators {
-			if operator.Name == additionalLog.Operator {
-				operatorFound = true
-
-				for _, tl := range operator.TiledLogs {
-					if tl.MonitoringURL == additionalLog.URL {
-						// Log already exists, skip it.
-						break tiledLogFound
-					}
-				}
-
-				// This works, since allLogs.Operators is a slice of pointers.
-				operator.TiledLogs = append(operator.TiledLogs, &customLog)
-
-				break
-			}
-		}
-
-		if !operatorFound {
-			newOperator := loglist3.Operator{
-				Name:      additionalLog.Operator,
-				TiledLogs: []*loglist3.TiledLog{&customLog},
-			}
-			allLogs.Operators = append(allLogs.Operators, &newOperator)
-		}
-	}
-
-	return allLogs, nil
-}
-
-func normalizeCtlogURL(input string) string {
-	input = strings.TrimPrefix(input, "https://")
-	input = strings.TrimPrefix(input, "http://")
-	input = strings.TrimSuffix(input, "/")
-
-	return input
 }
 
 // newHTTPClient creates a new http.Client with reasonable timeouts and connection settings for interacting with CT logs.

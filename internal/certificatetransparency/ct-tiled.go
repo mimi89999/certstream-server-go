@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -36,7 +38,7 @@ type TileLeaf struct {
 }
 
 var (
-	EntryTypeCert    uint16 = 0
+	EntryTypeCert    uint16
 	EntryTypePrecert uint16 = 1
 )
 
@@ -54,7 +56,7 @@ func encodeTilePath(index uint64) string {
 
 	// Build path from groups in reverse
 	var builder strings.Builder
-	for i := len(groups) - 1; i >= 0; i-- {
+	for i, v := range slices.Backward(groups) {
 		if i < len(groups)-1 {
 			builder.WriteByte('/')
 		}
@@ -63,7 +65,7 @@ func encodeTilePath(index uint64) string {
 			builder.WriteByte('x')
 		}
 
-		fmt.Fprintf(&builder, "%03d", groups[i])
+		fmt.Fprintf(&builder, "%03d", v)
 	}
 
 	return builder.String()
@@ -188,6 +190,11 @@ func ParseTileData(data []byte) ([]TileLeaf, error) {
 
 // ConvertTileLeafToRawLogEntry converts a TileLeaf to ct.RawLogEntry for compatibility.
 func ConvertTileLeafToRawLogEntry(leaf TileLeaf, index uint64) *ct.RawLogEntry {
+	if index > math.MaxInt64 {
+		log.Printf("index (%d) exceeds math.MaxInt64, skipping\n", index)
+		return nil
+	}
+
 	rawEntry := &ct.RawLogEntry{
 		Index: int64(index),
 		Leaf: ct.MerkleTreeLeaf{
@@ -224,12 +231,25 @@ func ConvertTileLeafToRawLogEntry(leaf TileLeaf, index uint64) *ct.RawLogEntry {
 
 	return rawEntry
 }
+
+// DefaultMaxPartialWait is the default maximum time to wait before forcefully
+// fetching a partial tile that has not yet grown into a full tile.
+const DefaultMaxPartialWait = 1 * time.Minute
+
 type StaticCTClient struct {
 	url        string
 	httpClient *http.Client
 	backoff    backoff.Backoff
 	userAgent  string
 	ctIndex    uint64
+
+	// Deferred partial-tile state.
+	// partialTileIndex holds the tile index of the currently tracked partial tile.
+	// partialTileFirstSeen is when that partial tile was first observed; zero means
+	// no partial tile is being tracked.
+	partialTileIndex     uint64
+	partialTileFirstSeen time.Time
+	maxPartialWait       time.Duration
 }
 
 func NewStaticCTClient(url string, httpClient *http.Client, userAgent string, startIndex uint64) *StaticCTClient {
@@ -244,11 +264,12 @@ func NewStaticCTClient(url string, httpClient *http.Client, userAgent string, st
 		},
 		userAgent:      userAgent,
 		ctIndex:        startIndex,
+		maxPartialWait: DefaultMaxPartialWait,
 	}
 }
 
 // Monitor continuously monitors the tiled CT log for new entries, starting from the current ctIndex.
-func (s *StaticCTClient) Monitor(ctx context.Context, foundCert func(*ct.RawLogEntry), foundPrecert func(*ct.RawLogEntry)) error {
+func (s *StaticCTClient) Monitor(ctx context.Context, foundCert, foundPrecert func(*ct.RawLogEntry)) error {
 	for {
 		hadNewEntries, err := s.fetchAndProcessTiles(ctx, foundCert, foundPrecert)
 		if err != nil {
@@ -277,7 +298,7 @@ func (s *StaticCTClient) Monitor(ctx context.Context, foundCert func(*ct.RawLogE
 
 // fetchAndProcessTiles checks for new entries in the tiled log and processes them.
 // It returns true if at least one full tile was fetched.
-func (s *StaticCTClient) fetchAndProcessTiles(ctx context.Context, foundCert func(*ct.RawLogEntry), foundPrecert func(*ct.RawLogEntry)) (bool, error) {
+func (s *StaticCTClient) fetchAndProcessTiles(ctx context.Context, foundCert, foundPrecert func(*ct.RawLogEntry)) (bool, error) {
 	// Fetch current checkpoint
 	checkpoint, fetchErr := s.FetchCheckpoint(ctx)
 	if fetchErr != nil {
@@ -291,31 +312,62 @@ func (s *StaticCTClient) fetchAndProcessTiles(ctx context.Context, foundCert fun
 	}
 
 	// Process entries from current index to new tree size
-	startTile := (s.ctIndex + 1) / TileSize
+	startTile := s.ctIndex / TileSize
 	endTile := currentTreeSize / TileSize
 
 	// Process full tiles
+	fetchedFullTiles := false
 	for tileIndex := startTile; tileIndex < endTile; tileIndex++ {
 		if err := s.processTile(ctx, tileIndex, 0, foundCert, foundPrecert); err != nil {
 			return false, fmt.Errorf("processing tile %d: %w", tileIndex, err)
 		}
+
+		fetchedFullTiles = true
 	}
 
-	// Process partial tile if exists
+	// When the current end tile has advanced past the tracked partial tile, that tile
+	// has since become a full tile and been processed; reset tracking so we start
+	// fresh for the new partial tile (if any).
+	if endTile > s.partialTileIndex {
+		s.partialTileFirstSeen = time.Time{}
+	}
+
+	// Process partial tiles.
 	partialSize := currentTreeSize % TileSize
 	if partialSize > 0 {
-		if err := s.processTile(ctx, endTile, partialSize, foundCert, foundPrecert); err != nil {
-			log.Printf("Warning: error processing partial tile %d: %s\n", endTile, err)
-			// Don't return error for partial tiles as they might be incomplete
+		switch {
+		case s.partialTileFirstSeen.IsZero() || s.partialTileIndex != endTile:
+			// First time we see this partial tile – start the deferral clock.
+			s.partialTileIndex = endTile
+			s.partialTileFirstSeen = time.Now()
+
+			// log.Println("Deferring fetch of partial tile", endTile, "with size", partialSize)
+
+		case time.Since(s.partialTileFirstSeen) >= s.maxPartialWait:
+			// The partial tile has been pending too long – fetch it now to prevent
+			// extreme processing delays on slow-growing logs.
+			if err := s.processTile(ctx, endTile, partialSize, foundCert, foundPrecert); err != nil {
+				log.Printf("Warning: error processing partial tile %d: %s\n", endTile, err)
+			}
+
+			// Reset tracking; the tile will be re-observed on the next poll if it
+			// still hasn't grown into a full tile.
+			s.partialTileFirstSeen = time.Time{}
+
+		default:
+			// Still within the deferral window – skip.
 		}
+	} else {
+		// currentTreeSize is an exact multiple of TileSize; no partial tile exists.
+		s.partialTileFirstSeen = time.Time{}
 	}
 
-	return true, nil
+	return fetchedFullTiles, nil
 }
 
 // processTile processes a single tile from the tiled log.
 // partialWidth of 0 means full tile, otherwise fetch partial tile with that width.
-func (s *StaticCTClient) processTile(ctx context.Context, tileIndex, partialWidth uint64, foundCert func(*ct.RawLogEntry), foundPrecert func(*ct.RawLogEntry)) error {
+func (s *StaticCTClient) processTile(ctx context.Context, tileIndex, partialWidth uint64, foundCert, foundPrecert func(*ct.RawLogEntry)) error {
 	leaves, err := s.fetchTile(ctx, tileIndex, partialWidth)
 	if err != nil {
 		return fmt.Errorf("fetching tile: %w", err)
@@ -328,7 +380,7 @@ func (s *StaticCTClient) processTile(ctx context.Context, tileIndex, partialWidt
 		entryIndex := baseIndex + uint64(i)
 
 		// Skip entries we've already processed
-		if entryIndex <= s.ctIndex {
+		if entryIndex < s.ctIndex {
 			continue
 		}
 
@@ -346,7 +398,7 @@ func (s *StaticCTClient) processTile(ctx context.Context, tileIndex, partialWidt
 		}
 
 		// Update the index
-		s.ctIndex = entryIndex
+		s.ctIndex = entryIndex + 1
 	}
 
 	return nil
